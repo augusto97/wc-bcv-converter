@@ -1,0 +1,43 @@
+🇻🇪 WOOCOMMERCE BCV CURRENCY CONVERTER
+========================================
+
+⚠️ IMPORTANTE: INSTALACIÓN PENDIENTE ⚠️
+
+Este paquete contiene archivos de ejemplo. Para el plugin completo y funcional:
+
+📥 DESCARGA MANUAL REQUERIDA:
+-----------------------------
+
+Desde la interfaz de Claude, descarga cada artifact individualmente:
+
+1. 'wc_bcv_converter' → Guardar como: wc-bcv-converter.php
+2. 'wc_bcv_js' → Guardar como: assets/wc-bcv-converter.js  
+3. 'bcv_readme' → Guardar como: README.md
+4. 'bcv_gateway_examples' → Guardar como: examples/gateway-integrations.php
+5. 'bcv_hooks_filters' → Guardar como: examples/advanced-hooks.php
+
+📁 ESTRUCTURA FINAL:
+-------------------
+wc-bcv-converter/
+├── wc-bcv-converter.php          ← REEMPLAZAR con artifact completo
+├── README.md                     ← REEMPLAZAR con documentación completa  
+├── assets/
+│   └── wc-bcv-converter.js       ← REEMPLAZAR con JS completo
+└── examples/
+    ├── gateway-integrations.php   ← REEMPLAZAR con integraciones completas
+    └── advanced-hooks.php         ← REEMPLAZAR con hooks completos
+
+🚀 DESPUÉS DE DESCARGAR:
+-----------------------
+1. Reemplaza todos los archivos con las versiones completas
+2. Sube la carpeta a /wp-content/plugins/
+3. Activa el plugin en WordPress
+4. Configura en WooCommerce → Conversor BCV
+
+📞 SOPORTE:
+----------
+- Consulta README.md para documentación completa
+- Los archivos examples/ contienen integraciones específicas
+- Modifica advanced-hooks.php para personalización avanzada
+
+¡El plugin estará listo para convertir USD a Bolívares automáticamente!
