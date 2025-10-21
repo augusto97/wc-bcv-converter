@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce BCV Currency Converter
  * Plugin URI: https://yoursite.com/
  * Description: Convierte automáticamente precios de USD a Bolívares Venezolanos usando la tasa oficial del BCV en el checkout
- * Version: 1.0.2
+ * Version: 1.1.0
  * Author: Tu Nombre
  * Text Domain: wc-bcv-converter
  * WC requires at least: 3.0
@@ -20,7 +20,7 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
 
 class WC_BCV_Converter {
     
-    private $plugin_version = '1.0.2';
+    private $plugin_version = '1.1.0';
     private $cache_key = 'bcv_exchange_rate';
     private $processing = false;
     private static $instance = null;
@@ -121,14 +121,23 @@ class WC_BCV_Converter {
     }
     
     private function get_daily_rate() {
+        // Si es fin de semana, usar tasa manual configurada el viernes
+        if ($this->is_weekend()) {
+            $weekend_rate = get_option('bcv_weekend_manual_rate');
+            if ($weekend_rate && $weekend_rate > 0) {
+                return floatval($weekend_rate);
+            }
+            // Si no hay tasa manual configurada, continuar con la lógica normal
+        }
+
         $today = $this->get_caracas_date();
         $stored_date = get_option('bcv_daily_rate_date');
         $stored_rate = get_option('bcv_daily_rate');
-        
+
         if ($stored_date === $today && $stored_rate && $stored_rate > 0) {
             return floatval($stored_rate);
         }
-        
+
         return false;
     }
     
@@ -144,7 +153,17 @@ class WC_BCV_Converter {
         $caracas_time = new DateTime('now', $caracas_timezone);
         return $caracas_time->format($format);
     }
-    
+
+    /**
+     * Verifica si hoy es fin de semana (sábado o domingo) en hora de Caracas
+     */
+    private function is_weekend() {
+        $caracas_timezone = new DateTimeZone('America/Caracas');
+        $caracas_time = new DateTime('now', $caracas_timezone);
+        $day_of_week = $caracas_time->format('N'); // 1 = Lunes, 7 = Domingo
+        return ($day_of_week == 6 || $day_of_week == 7); // 6 = Sábado, 7 = Domingo
+    }
+
     private function get_fallback_rate() {
         $fallback = get_option('bcv_fallback_rate', 126);
         return floatval($fallback);
@@ -418,10 +437,16 @@ class WC_BCV_Converter {
     }
     
     public function update_daily_rate() {
+        // No actualizar automáticamente en fines de semana
+        // El cliente configurará manualmente la tasa el viernes
+        if ($this->is_weekend()) {
+            return;
+        }
+
         $this->processing = true;
         $rate = $this->fetch_bcv_rate();
         $this->processing = false;
-        
+
         if ($rate && $rate >= 80 && $rate <= 300) {
             $this->store_daily_rate($rate);
         }
@@ -444,6 +469,7 @@ class WC_BCV_Converter {
         register_setting('bcv_converter_settings', 'bcv_display_mode');
         register_setting('bcv_converter_settings', 'bcv_payment_gateway_mode');
         register_setting('bcv_converter_settings', 'bcv_fallback_rate');
+        register_setting('bcv_converter_settings', 'bcv_weekend_manual_rate');
     }
     
     public function admin_page() {
@@ -499,12 +525,54 @@ class WC_BCV_Converter {
                             <p class="description">Tasa a usar cuando no se pueda obtener del BCV</p>
                         </td>
                     </tr>
+                    <tr style="background-color: #fff3cd; border-left: 4px solid #ffc107;">
+                        <th scope="row">
+                            <span style="color: #856404;">📅 Tasa Manual para Fines de Semana</span>
+                        </th>
+                        <td>
+                            <input type="number" name="bcv_weekend_manual_rate" value="<?php echo get_option('bcv_weekend_manual_rate', ''); ?>" step="0.01" min="0.01" placeholder="Ej: 55.50">
+                            <p class="description" style="color: #856404;">
+                                <strong>⚠️ Importante:</strong> Configure esta tasa el <strong>viernes por la tarde</strong> para que se use durante todo el fin de semana (sábado y domingo).
+                                <br>Esta será la tasa del banco que le proporcionen para el lunes siguiente.
+                                <br>Durante el fin de semana, el sistema <strong>NO consultará</strong> la tasa automática y usará este valor.
+                            </p>
+                        </td>
+                    </tr>
                 </table>
                 
                 <div style="background: #f1f1f1; padding: 20px; margin: 20px 0; border-radius: 5px;">
                     <h3>📊 Estado Actual</h3>
                     <p><strong>Tasa actual:</strong> 1 USD = <?php echo number_format($current_rate, 2, ',', '.'); ?> Bs.</p>
-                    <p><strong>Envío a pasarela:</strong> 
+
+                    <?php
+                    $is_weekend = false;
+                    $caracas_timezone = new DateTimeZone('America/Caracas');
+                    $caracas_time = new DateTime('now', $caracas_timezone);
+                    $day_of_week = $caracas_time->format('N');
+                    $is_weekend = ($day_of_week == 6 || $day_of_week == 7);
+                    $weekend_rate = get_option('bcv_weekend_manual_rate');
+                    ?>
+
+                    <p><strong>Modo de tasa:</strong>
+                        <?php if ($is_weekend && $weekend_rate && $weekend_rate > 0): ?>
+                            <span style="color: #ffc107; font-weight: bold; background: #fff3cd; padding: 4px 8px; border-radius: 3px;">
+                                📅 TASA MANUAL DE FIN DE SEMANA (<?php echo number_format($weekend_rate, 2, ',', '.'); ?> Bs.)
+                            </span>
+                            <br><small style="color: #856404;">Usando tasa configurada para sábado/domingo</small>
+                        <?php elseif ($is_weekend && (!$weekend_rate || $weekend_rate <= 0)): ?>
+                            <span style="color: #dc3545; font-weight: bold; background: #f8d7da; padding: 4px 8px; border-radius: 3px;">
+                                ⚠️ FIN DE SEMANA - TASA MANUAL NO CONFIGURADA
+                            </span>
+                            <br><small style="color: #721c24;">Configure la tasa manual arriba para fines de semana</small>
+                        <?php else: ?>
+                            <span style="color: #28a745; font-weight: bold; background: #d4edda; padding: 4px 8px; border-radius: 3px;">
+                                🔄 TASA AUTOMÁTICA BCV
+                            </span>
+                            <br><small style="color: #155724;">Se actualiza automáticamente todos los días a las 8:00 AM</small>
+                        <?php endif; ?>
+                    </p>
+
+                    <p><strong>Envío a pasarela:</strong>
                         <?php if ($payment_mode === 'ves'): ?>
                             <span style="color: #28a745; font-weight: bold;">🇻🇪 BOLÍVARES</span>
                         <?php else: ?>
@@ -552,6 +620,7 @@ register_activation_hook(__FILE__, function() {
     add_option('bcv_display_mode', 'both');
     add_option('bcv_payment_gateway_mode', 'ves');
     add_option('bcv_fallback_rate', 126);
+    add_option('bcv_weekend_manual_rate', '');
 });
 
 register_deactivation_hook(__FILE__, function() {
