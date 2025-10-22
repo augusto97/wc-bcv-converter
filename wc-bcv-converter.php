@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce BCV Currency Converter
  * Plugin URI: https://yoursite.com/
  * Description: Convierte automáticamente precios de USD a Bolívares Venezolanos usando la tasa oficial del BCV en el checkout
- * Version: 1.3.0
+ * Version: 1.3.1
  * Author: Tu Nombre
  * Text Domain: wc-bcv-converter
  * WC requires at least: 3.0
@@ -18,9 +18,16 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
     return;
 }
 
+// Declarar compatibilidad con HPOS (High-Performance Order Storage)
+add_action('before_woocommerce_init', function() {
+    if (class_exists(\Automattic\WooCommerce\Utilities\FeaturesUtil::class)) {
+        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
+    }
+});
+
 class WC_BCV_Converter {
     
-    private $plugin_version = '1.3.0';
+    private $plugin_version = '1.3.1';
     private $cache_key = 'bcv_exchange_rate';
     private $processing = false;
     private static $instance = null;
