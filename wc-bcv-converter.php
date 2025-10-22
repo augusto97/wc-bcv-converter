@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce BCV Currency Converter
  * Plugin URI: https://yoursite.com/
  * Description: Convierte automáticamente precios de USD a Bolívares Venezolanos usando la tasa oficial del BCV en el checkout
- * Version: 1.1.0
+ * Version: 1.2.0
  * Author: Tu Nombre
  * Text Domain: wc-bcv-converter
  * WC requires at least: 3.0
@@ -20,7 +20,7 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
 
 class WC_BCV_Converter {
     
-    private $plugin_version = '1.1.0';
+    private $plugin_version = '1.2.0';
     private $cache_key = 'bcv_exchange_rate';
     private $processing = false;
     private static $instance = null;
@@ -37,6 +37,7 @@ class WC_BCV_Converter {
         add_action('wp_enqueue_scripts', array($this, 'enqueue_scripts'));
         add_action('admin_menu', array($this, 'add_admin_menu'));
         add_action('admin_init', array($this, 'admin_init'));
+        add_action('admin_enqueue_scripts', array($this, 'enqueue_admin_scripts'));
         
         // Hooks del frontend
         if (!is_admin()) {
@@ -61,13 +62,13 @@ class WC_BCV_Converter {
     public function enqueue_scripts() {
         if (is_cart() || is_checkout()) {
             wp_enqueue_script(
-                'wc-bcv-converter', 
-                plugin_dir_url(__FILE__) . 'assets/wc-bcv-converter.js', 
-                array('jquery'), 
-                $this->plugin_version, 
+                'wc-bcv-converter',
+                plugin_dir_url(__FILE__) . 'assets/wc-bcv-converter.js',
+                array('jquery'),
+                $this->plugin_version,
                 true
             );
-            
+
             wp_localize_script('wc-bcv-converter', 'wcBcv', array(
                 'ajax_url' => admin_url('admin-ajax.php'),
                 'nonce' => wp_create_nonce('bcv_nonce'),
@@ -76,6 +77,44 @@ class WC_BCV_Converter {
                 'display_mode' => get_option('bcv_display_mode', 'both')
             ));
         }
+    }
+
+    public function enqueue_admin_scripts($hook) {
+        // Solo cargar en la página del plugin
+        if ($hook !== 'woocommerce_page_bcv-converter') {
+            return;
+        }
+
+        wp_add_inline_script('jquery', "
+            jQuery(document).ready(function($) {
+                function updateVenezuelaTime() {
+                    var now = new Date();
+                    var offsetCaracas = -4; // UTC-4
+                    var utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+                    var caracasTime = new Date(utc + (3600000 * offsetCaracas));
+
+                    var days = ['Domingo', 'Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado'];
+                    var dayName = days[caracasTime.getDay()];
+
+                    var hours = caracasTime.getHours().toString().padStart(2, '0');
+                    var minutes = caracasTime.getMinutes().toString().padStart(2, '0');
+                    var seconds = caracasTime.getSeconds().toString().padStart(2, '0');
+
+                    var dateStr = caracasTime.getFullYear() + '-' +
+                                  (caracasTime.getMonth() + 1).toString().padStart(2, '0') + '-' +
+                                  caracasTime.getDate().toString().padStart(2, '0');
+
+                    $('#bcv-venezuela-time').html(
+                        '<strong>' + dayName + '</strong>, ' + dateStr + ' - ' +
+                        '<span style=\"font-size: 1.3em; color: #0073aa;\">' + hours + ':' + minutes + ':' + seconds + '</span> ' +
+                        '<small>(Venezuela UTC-4)</small>'
+                    );
+                }
+
+                updateVenezuelaTime();
+                setInterval(updateVenezuelaTime, 1000);
+            });
+        ");
     }
     
     public function init_frontend_hooks() {
@@ -420,18 +459,34 @@ class WC_BCV_Converter {
     
     // SISTEMA DE ACTUALIZACIÓN DIARIA
     public function schedule_daily_rate_update() {
-        if (!wp_next_scheduled('bcv_daily_rate_update')) {
+        $sync_hour = intval(get_option('bcv_sync_hour', 8));
+        $scheduled = wp_next_scheduled('bcv_daily_rate_update');
+
+        // Si cambió la hora de sincronización, reprogramar
+        if ($scheduled) {
+            $caracas_timezone = new DateTimeZone('America/Caracas');
+            $scheduled_time = new DateTime('@' . $scheduled);
+            $scheduled_time->setTimezone($caracas_timezone);
+            $scheduled_hour = intval($scheduled_time->format('H'));
+
+            if ($scheduled_hour != $sync_hour) {
+                wp_clear_scheduled_hook('bcv_daily_rate_update');
+                $scheduled = false;
+            }
+        }
+
+        if (!$scheduled) {
             $caracas_timezone = new DateTimeZone('America/Caracas');
             $caracas_time = new DateTime('now', $caracas_timezone);
-            
-            if ($caracas_time->format('H') >= 8) {
+
+            if ($caracas_time->format('H') >= $sync_hour) {
                 $caracas_time->modify('+1 day');
             }
-            
-            $caracas_time->setTime(8, 0, 0);
+
+            $caracas_time->setTime($sync_hour, 0, 0);
             $caracas_time->setTimezone(new DateTimeZone('UTC'));
             $timestamp = $caracas_time->getTimestamp();
-            
+
             wp_schedule_event($timestamp, 'daily', 'bcv_daily_rate_update');
         }
     }
@@ -470,15 +525,32 @@ class WC_BCV_Converter {
         register_setting('bcv_converter_settings', 'bcv_payment_gateway_mode');
         register_setting('bcv_converter_settings', 'bcv_fallback_rate');
         register_setting('bcv_converter_settings', 'bcv_weekend_manual_rate');
+        register_setting('bcv_converter_settings', 'bcv_sync_hour', array(
+            'type' => 'integer',
+            'default' => 8
+        ));
     }
     
     public function admin_page() {
         $current_rate = $this->get_bcv_exchange_rate();
         $payment_mode = get_option('bcv_payment_gateway_mode', 'ves');
-        
+
+        // Información de sincronización
+        $next_scheduled = wp_next_scheduled('bcv_daily_rate_update');
+        $last_update_date = get_option('bcv_daily_rate_date');
+        $last_update_time = get_option('bcv_daily_rate_time');
+        $sync_hour = get_option('bcv_sync_hour', 8);
+
+        $caracas_timezone = new DateTimeZone('America/Caracas');
         ?>
         <div class="wrap">
             <h1>🇻🇪 Conversor BCV - WooCommerce</h1>
+
+            <!-- Reloj de Venezuela -->
+            <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; margin: 20px 0; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1);">
+                <h2 style="margin: 0 0 10px 0; color: white; font-size: 18px;">🕐 Hora Actual de Venezuela</h2>
+                <div id="bcv-venezuela-time" style="font-size: 20px; font-weight: bold;">Cargando...</div>
+            </div>
             
             <?php if ($payment_mode === 'ves'): ?>
             <div class="notice notice-success">
@@ -525,6 +597,24 @@ class WC_BCV_Converter {
                             <p class="description">Tasa a usar cuando no se pueda obtener del BCV</p>
                         </td>
                     </tr>
+                    <tr style="background-color: #e7f3ff; border-left: 4px solid #0073aa;">
+                        <th scope="row">
+                            <span style="color: #0073aa;">⏰ Hora de Sincronización Automática</span>
+                        </th>
+                        <td>
+                            <select name="bcv_sync_hour">
+                                <?php for ($h = 0; $h < 24; $h++): ?>
+                                    <option value="<?php echo $h; ?>" <?php selected($sync_hour, $h); ?>>
+                                        <?php echo sprintf('%02d:00 (Hora de Venezuela)', $h); ?>
+                                    </option>
+                                <?php endfor; ?>
+                            </select>
+                            <p class="description" style="color: #0073aa;">
+                                <strong>Hora de Venezuela (UTC-4)</strong> a la que se consultará la tasa del BCV automáticamente cada día.
+                                <br>Por defecto: 08:00 AM. Esta sincronización NO ocurre en fines de semana.
+                            </p>
+                        </td>
+                    </tr>
                     <tr style="background-color: #fff3cd; border-left: 4px solid #ffc107;">
                         <th scope="row">
                             <span style="color: #856404;">📅 Tasa Manual para Fines de Semana</span>
@@ -546,12 +636,64 @@ class WC_BCV_Converter {
 
                     <?php
                     $is_weekend = false;
-                    $caracas_timezone = new DateTimeZone('America/Caracas');
                     $caracas_time = new DateTime('now', $caracas_timezone);
                     $day_of_week = $caracas_time->format('N');
                     $is_weekend = ($day_of_week == 6 || $day_of_week == 7);
                     $weekend_rate = get_option('bcv_weekend_manual_rate');
                     ?>
+
+                    <!-- Información de Sincronización -->
+                    <div style="background: white; padding: 15px; margin: 15px 0; border-left: 4px solid #0073aa; border-radius: 4px;">
+                        <h4 style="margin-top: 0; color: #0073aa;">⏰ Información de Sincronización Automática</h4>
+
+                        <?php if ($last_update_date && $last_update_time): ?>
+                            <p style="margin: 8px 0;">
+                                <strong>📥 Última actualización:</strong>
+                                <span style="color: #28a745;"><?php echo $last_update_date; ?> a las <?php echo $last_update_time; ?> (Hora Venezuela)</span>
+                            </p>
+                        <?php else: ?>
+                            <p style="margin: 8px 0;">
+                                <strong>📥 Última actualización:</strong>
+                                <span style="color: #dc3545;">No hay registro de actualización</span>
+                            </p>
+                        <?php endif; ?>
+
+                        <?php if ($next_scheduled): ?>
+                            <?php
+                            $next_time = new DateTime('@' . $next_scheduled);
+                            $next_time->setTimezone($caracas_timezone);
+                            $next_date = $next_time->format('Y-m-d');
+                            $next_hour = $next_time->format('H:i:s');
+                            $next_day_name = $next_time->format('l');
+                            $days_es = array(
+                                'Monday' => 'Lunes',
+                                'Tuesday' => 'Martes',
+                                'Wednesday' => 'Miércoles',
+                                'Thursday' => 'Jueves',
+                                'Friday' => 'Viernes',
+                                'Saturday' => 'Sábado',
+                                'Sunday' => 'Domingo'
+                            );
+                            $next_day_name_es = $days_es[$next_day_name];
+                            ?>
+                            <p style="margin: 8px 0;">
+                                <strong>📤 Próxima sincronización:</strong>
+                                <span style="color: #0073aa; font-weight: bold;">
+                                    <?php echo $next_day_name_es; ?>, <?php echo $next_date; ?> a las <?php echo $next_hour; ?> (Hora Venezuela)
+                                </span>
+                            </p>
+                        <?php else: ?>
+                            <p style="margin: 8px 0;">
+                                <strong>📤 Próxima sincronización:</strong>
+                                <span style="color: #dc3545;">No programada - Guarda la configuración para programar</span>
+                            </p>
+                        <?php endif; ?>
+
+                        <p style="margin: 8px 0; padding: 10px; background: #e7f3ff; border-radius: 4px; font-size: 13px;">
+                            💡 <strong>Nota:</strong> La sincronización automática consulta la tasa del BCV a la hora configurada (<?php echo sprintf('%02d:00', $sync_hour); ?> Venezuela).
+                            Durante los fines de semana (sábado y domingo) NO se sincroniza automáticamente; se usa la tasa manual configurada.
+                        </p>
+                    </div>
 
                     <p><strong>Modo de tasa:</strong>
                         <?php if ($is_weekend && $weekend_rate && $weekend_rate > 0): ?>
@@ -621,6 +763,7 @@ register_activation_hook(__FILE__, function() {
     add_option('bcv_payment_gateway_mode', 'ves');
     add_option('bcv_fallback_rate', 126);
     add_option('bcv_weekend_manual_rate', '');
+    add_option('bcv_sync_hour', 8);
 });
 
 register_deactivation_hook(__FILE__, function() {
