@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce BCV Currency Converter
  * Plugin URI: https://yoursite.com/
  * Description: Convierte automáticamente precios de USD a Bolívares Venezolanos usando la tasa oficial del BCV en el checkout
- * Version: 1.2.0
+ * Version: 1.3.0
  * Author: Tu Nombre
  * Text Domain: wc-bcv-converter
  * WC requires at least: 3.0
@@ -20,7 +20,7 @@ if (!in_array('woocommerce/woocommerce.php', apply_filters('active_plugins', get
 
 class WC_BCV_Converter {
     
-    private $plugin_version = '1.2.0';
+    private $plugin_version = '1.3.0';
     private $cache_key = 'bcv_exchange_rate';
     private $processing = false;
     private static $instance = null;
@@ -50,9 +50,10 @@ class WC_BCV_Converter {
         
         // Hook simple para pasarela
         add_filter('woocommerce_order_get_total', array($this, 'maybe_convert_for_gateway'), 10, 2);
-        
+
         // AJAX
         add_action('wp_ajax_bcv_refresh_rate', array($this, 'ajax_refresh_rate'));
+        add_action('wp_ajax_bcv_force_update', array($this, 'ajax_force_update'));
     }
     
     public function init() {
@@ -85,6 +86,11 @@ class WC_BCV_Converter {
             return;
         }
 
+        wp_localize_script('jquery', 'bcvAdmin', array(
+            'ajax_url' => admin_url('admin-ajax.php'),
+            'nonce' => wp_create_nonce('bcv_admin_nonce')
+        ));
+
         wp_add_inline_script('jquery', "
             jQuery(document).ready(function($) {
                 function updateVenezuelaTime() {
@@ -113,6 +119,50 @@ class WC_BCV_Converter {
 
                 updateVenezuelaTime();
                 setInterval(updateVenezuelaTime, 1000);
+
+                // Botón de actualización manual
+                $('#bcv-force-update-btn').on('click', function(e) {
+                    e.preventDefault();
+                    var \$btn = $(this);
+                    var \$status = $('#bcv-update-status');
+
+                    \$btn.prop('disabled', true).text('🔄 Actualizando...');
+                    \$status.html('<div class=\"notice notice-info\"><p>⏳ Consultando tasa del BCV...</p></div>');
+
+                    $.ajax({
+                        url: bcvAdmin.ajax_url,
+                        type: 'POST',
+                        data: {
+                            action: 'bcv_force_update',
+                            nonce: bcvAdmin.nonce
+                        },
+                        success: function(response) {
+                            if (response.success) {
+                                \$status.html(
+                                    '<div class=\"notice notice-success\"><p><strong>✅ Tasa actualizada exitosamente!</strong><br>' +
+                                    'Nueva tasa: <strong>' + response.data.formatted + ' Bs.</strong><br>' +
+                                    'Actualizada el: ' + response.data.date + ' a las ' + response.data.time + ' (Hora Venezuela)</p></div>'
+                                );
+                                setTimeout(function() {
+                                    location.reload();
+                                }, 2000);
+                            } else {
+                                \$status.html(
+                                    '<div class=\"notice notice-error\"><p><strong>❌ Error al actualizar:</strong> ' +
+                                    (response.data || 'No se pudo obtener la tasa del BCV') + '</p></div>'
+                                );
+                                \$btn.prop('disabled', false).text('🔄 Actualizar Tasa Ahora');
+                            }
+                        },
+                        error: function() {
+                            \$status.html(
+                                '<div class=\"notice notice-error\"><p><strong>❌ Error de conexión</strong><br>' +
+                                'No se pudo comunicar con el servidor. Intenta de nuevo.</p></div>'
+                            );
+                            \$btn.prop('disabled', false).text('🔄 Actualizar Tasa Ahora');
+                        }
+                    });
+                });
             });
         ");
     }
@@ -164,6 +214,7 @@ class WC_BCV_Converter {
         if ($this->is_weekend()) {
             $weekend_rate = get_option('bcv_weekend_manual_rate');
             if ($weekend_rate && $weekend_rate > 0) {
+                error_log("BCV: Usando tasa manual de fin de semana: $weekend_rate Bs.");
                 return floatval($weekend_rate);
             }
             // Si no hay tasa manual configurada, continuar con la lógica normal
@@ -173,18 +224,29 @@ class WC_BCV_Converter {
         $stored_date = get_option('bcv_daily_rate_date');
         $stored_rate = get_option('bcv_daily_rate');
 
+        error_log("BCV: Comparando fechas - Hoy: $today, Almacenada: $stored_date, Tasa almacenada: $stored_rate");
+
         if ($stored_date === $today && $stored_rate && $stored_rate > 0) {
+            error_log("BCV: Usando tasa almacenada de hoy: $stored_rate Bs.");
             return floatval($stored_rate);
         }
 
+        error_log("BCV: Fecha no coincide o no hay tasa almacenada, se requiere actualización");
         return false;
     }
     
     private function store_daily_rate($rate) {
-        $today = $this->get_caracas_date();
+        $caracas_timezone = new DateTimeZone('America/Caracas');
+        $caracas_time = new DateTime('now', $caracas_timezone);
+        $today = $caracas_time->format('Y-m-d');
+        $time = $caracas_time->format('H:i:s');
+
         update_option('bcv_daily_rate', $rate);
         update_option('bcv_daily_rate_date', $today);
-        update_option('bcv_daily_rate_time', current_time('H:i:s'));
+        update_option('bcv_daily_rate_time', $time);
+
+        // Log para debugging
+        error_log("BCV: Tasa actualizada - Fecha: $today, Hora: $time (Venezuela), Tasa: $rate Bs.");
     }
     
     private function get_caracas_date($format = 'Y-m-d') {
@@ -551,6 +613,16 @@ class WC_BCV_Converter {
                 <h2 style="margin: 0 0 10px 0; color: white; font-size: 18px;">🕐 Hora Actual de Venezuela</h2>
                 <div id="bcv-venezuela-time" style="font-size: 20px; font-weight: bold;">Cargando...</div>
             </div>
+
+            <!-- Botón de actualización manual -->
+            <div style="background: white; padding: 20px; margin: 20px 0; border-radius: 8px; border-left: 4px solid #00a32a; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+                <h2 style="margin: 0 0 15px 0; color: #00a32a; font-size: 18px;">🔄 Actualización Manual de Tasa</h2>
+                <p style="margin-bottom: 15px;">Si necesitas actualizar la tasa inmediatamente sin esperar la sincronización automática, usa este botón:</p>
+                <button id="bcv-force-update-btn" type="button" class="button button-primary button-hero" style="margin-bottom: 10px;">
+                    🔄 Actualizar Tasa Ahora
+                </button>
+                <div id="bcv-update-status"></div>
+            </div>
             
             <?php if ($payment_mode === 'ves'): ?>
             <div class="notice notice-success">
@@ -745,7 +817,36 @@ class WC_BCV_Converter {
                 'formatted' => number_format($new_rate, 2, ',', '.')
             ));
         } else {
-            wp_send_json_error();
+            wp_send_json_error(array('message' => 'No se pudo obtener la tasa del BCV'));
+        }
+    }
+
+    public function ajax_force_update() {
+        check_ajax_referer('bcv_admin_nonce', 'nonce');
+
+        if (!current_user_can('manage_options')) {
+            wp_send_json_error('No tienes permisos para realizar esta acción');
+        }
+
+        // Forzar actualización ignorando el cache
+        $this->processing = true;
+        $new_rate = $this->fetch_bcv_rate();
+        $this->processing = false;
+
+        if ($new_rate && $new_rate >= 80 && $new_rate <= 300) {
+            $this->store_daily_rate($new_rate);
+
+            $caracas_timezone = new DateTimeZone('America/Caracas');
+            $caracas_time = new DateTime('now', $caracas_timezone);
+
+            wp_send_json_success(array(
+                'rate' => $new_rate,
+                'formatted' => number_format($new_rate, 2, ',', '.'),
+                'date' => $caracas_time->format('Y-m-d'),
+                'time' => $caracas_time->format('H:i:s')
+            ));
+        } else {
+            wp_send_json_error('No se pudo obtener una tasa válida del BCV. La tasa debe estar entre 80 y 300 Bs.');
         }
     }
 }
