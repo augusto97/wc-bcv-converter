@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce BCV Currency Converter
  * Plugin URI: https://yoursite.com/
  * Description: Convierte automáticamente precios de USD a Bolívares Venezolanos usando la tasa oficial del BCV en el checkout
- * Version: 1.4.0
+ * Version: 1.5.0
  * Author: Tu Nombre
  * Text Domain: wc-bcv-converter
  * WC requires at least: 3.0
@@ -27,7 +27,7 @@ add_action('before_woocommerce_init', function() {
 
 class WC_BCV_Converter {
 
-    private $plugin_version = '1.4.0';
+    private $plugin_version = '1.5.0';
     private $cache_key = 'bcv_exchange_rate';
     private $processing = false;
     private static $instance = null;
@@ -217,32 +217,73 @@ class WC_BCV_Converter {
     }
     
     private function get_daily_rate() {
-        // Si es fin de semana, usar tasa manual configurada el viernes
-        if ($this->is_weekend()) {
+        $rate_mode = get_option('bcv_rate_mode', 'automatic');
+
+        // MODO MANUAL: Usar tasa fija configurada por el administrador
+        if ($rate_mode === 'manual') {
+            $manual_rate = get_option('bcv_manual_rate', 0);
+            if ($manual_rate && $manual_rate > 0) {
+                error_log("BCV: [MODO MANUAL] Usando tasa fija configurada: $manual_rate Bs.");
+                return floatval($manual_rate);
+            }
+            error_log("BCV: [MODO MANUAL] No hay tasa manual configurada, usando fallback");
+            return $this->get_fallback_rate();
+        }
+
+        // MODO AUTOMÁTICO: Obtener tasa dinámica
+        error_log("BCV: [MODO AUTOMÁTICO] Obteniendo tasa dinámica");
+
+        // Si es fin de semana Y el modo fin de semana está habilitado
+        $weekend_mode_enabled = get_option('bcv_weekend_mode_enabled', false);
+        if ($this->is_weekend() && $weekend_mode_enabled) {
             $weekend_rate = get_option('bcv_weekend_manual_rate');
             if ($weekend_rate && $weekend_rate > 0) {
                 error_log("BCV: Usando tasa manual de fin de semana: $weekend_rate Bs.");
                 return floatval($weekend_rate);
             }
-            // Si no hay tasa manual configurada, continuar con la lógica normal
             error_log("BCV: Fin de semana detectado pero sin tasa manual configurada");
         }
 
-        $today = $this->get_caracas_date();
+        // Determinar qué tasa usar basado en la hora de aplicación
+        $caracas_timezone = new DateTimeZone('America/Caracas');
+        $caracas_now = new DateTime('now', $caracas_timezone);
+        $current_hour = intval($caracas_now->format('H'));
+        $current_minute = intval($caracas_now->format('i'));
+        $today = $caracas_now->format('Y-m-d');
+
+        $apply_hour = intval(get_option('bcv_apply_hour', 0));
+        $apply_minute = intval(get_option('bcv_apply_minute', 30));
+
+        // Calcular minutos desde medianoche
+        $current_minutes = ($current_hour * 60) + $current_minute;
+        $apply_minutes = ($apply_hour * 60) + $apply_minute;
+
+        error_log(sprintf("BCV: Hora actual: %02d:%02d (%d min), Hora aplicación: %02d:%02d (%d min)",
+            $current_hour, $current_minute, $current_minutes, $apply_hour, $apply_minute, $apply_minutes));
+
+        // Si aún no es hora de aplicar la nueva tasa, usar la tasa del día anterior
+        $target_date = $today;
+        if ($current_minutes < $apply_minutes) {
+            $yesterday = clone $caracas_now;
+            $yesterday->modify('-1 day');
+            $target_date = $yesterday->format('Y-m-d');
+            error_log("BCV: Aún no es hora de aplicar nueva tasa, usando tasa de: $target_date");
+        }
+
         $stored_date = get_option('bcv_daily_rate_date');
         $stored_rate = get_option('bcv_daily_rate');
 
-        error_log("BCV: Comparando fechas - Hoy: $today, Almacenada: $stored_date, Tasa almacenada: $stored_rate");
+        error_log("BCV: Comparando fechas - Target: $target_date, Almacenada: $stored_date, Tasa: $stored_rate");
 
-        // Si la fecha almacenada coincide con hoy, usar esa tasa
-        if ($stored_date === $today && $stored_rate && $stored_rate > 0) {
-            error_log("BCV: Usando tasa almacenada de hoy: $stored_rate Bs.");
+        // Si la fecha almacenada coincide con la fecha objetivo, usar esa tasa
+        if ($stored_date === $target_date && $stored_rate && $stored_rate > 0) {
+            error_log("BCV: ✓ Usando tasa almacenada de $target_date: $stored_rate Bs.");
             return floatval($stored_rate);
         }
 
-        // MEJORA: Detectar si la tasa es antigua y necesita actualización urgente
-        if ($stored_date && $stored_date !== $today) {
-            $days_diff = $this->get_business_days_diff($stored_date, $today);
+        // RECUPERACIÓN AUTOMÁTICA: Detectar si la tasa es antigua
+        if ($stored_date && $stored_date !== $target_date) {
+            $days_diff = $this->get_business_days_diff($stored_date, $target_date);
             error_log("BCV: Tasa desactualizada detectada. Días laborables de diferencia: $days_diff");
 
             // Si la tasa es de 1+ días laborables atrás, intentar actualización inmediata
@@ -250,8 +291,8 @@ class WC_BCV_Converter {
                 error_log("BCV: ⚠️ RECUPERACIÓN AUTOMÁTICA - Tasa antigua detectada, forzando actualización inmediata");
                 $new_rate = $this->fetch_bcv_rate();
                 if ($new_rate && $new_rate >= 80 && $new_rate <= 300) {
-                    $this->store_daily_rate($new_rate);
-                    error_log("BCV: ✅ Recuperación exitosa - Nueva tasa: $new_rate Bs.");
+                    $this->store_daily_rate($new_rate, $target_date);
+                    error_log("BCV: ✅ Recuperación exitosa - Nueva tasa: $new_rate Bs. para $target_date");
                     return $new_rate;
                 } else {
                     error_log("BCV: ❌ Recuperación falló - Usando tasa almacenada antigua como respaldo");
@@ -267,18 +308,22 @@ class WC_BCV_Converter {
         return false;
     }
     
-    private function store_daily_rate($rate) {
+    private function store_daily_rate($rate, $target_date = null) {
         $caracas_timezone = new DateTimeZone('America/Caracas');
         $caracas_time = new DateTime('now', $caracas_timezone);
-        $today = $caracas_time->format('Y-m-d');
         $time = $caracas_time->format('H:i:s');
 
+        // Si no se especifica fecha objetivo, usar hoy
+        if ($target_date === null) {
+            $target_date = $caracas_time->format('Y-m-d');
+        }
+
         update_option('bcv_daily_rate', $rate);
-        update_option('bcv_daily_rate_date', $today);
+        update_option('bcv_daily_rate_date', $target_date);
         update_option('bcv_daily_rate_time', $time);
 
         // Log para debugging
-        error_log("BCV: Tasa actualizada - Fecha: $today, Hora: $time (Venezuela), Tasa: $rate Bs.");
+        error_log("BCV: Tasa actualizada - Fecha: $target_date, Hora: $time (Venezuela), Tasa: $rate Bs.");
     }
     
     private function get_caracas_date($format = 'Y-m-d') {
@@ -601,6 +646,19 @@ class WC_BCV_Converter {
     
     // SISTEMA DE ACTUALIZACIÓN DIARIA
     public function schedule_daily_rate_update() {
+        // Solo programar cron si estamos en modo automático
+        $rate_mode = get_option('bcv_rate_mode', 'automatic');
+        if ($rate_mode !== 'automatic') {
+            // Si está en modo manual, no necesitamos cron
+            // Limpiar cron existente si lo hay
+            $scheduled = wp_next_scheduled('bcv_daily_rate_update');
+            if ($scheduled) {
+                wp_clear_scheduled_hook('bcv_daily_rate_update');
+                error_log("BCV: Cron cancelado (modo manual activado)");
+            }
+            return;
+        }
+
         // OPTIMIZACIÓN: Solo verificar el cron cada 6 horas en lugar de cada carga de página
         $last_check = get_transient('bcv_cron_last_check');
         if ($last_check !== false) {
@@ -611,18 +669,18 @@ class WC_BCV_Converter {
         // Marcar que verificamos ahora (válido por 6 horas)
         set_transient('bcv_cron_last_check', time(), 6 * HOUR_IN_SECONDS);
 
-        $sync_hour = intval(get_option('bcv_sync_hour', 8));
+        $scan_hour = intval(get_option('bcv_scan_hour', 21)); // Default: 9pm
         $scheduled = wp_next_scheduled('bcv_daily_rate_update');
 
-        // Si cambió la hora de sincronización, reprogramar
+        // Si cambió la hora de escaneo, reprogramar
         if ($scheduled) {
             $caracas_timezone = new DateTimeZone('America/Caracas');
             $scheduled_time = new DateTime('@' . $scheduled);
             $scheduled_time->setTimezone($caracas_timezone);
             $scheduled_hour = intval($scheduled_time->format('H'));
 
-            if ($scheduled_hour != $sync_hour) {
-                error_log("BCV: Hora de sincronización cambió de $scheduled_hour a $sync_hour, reprogramando cron");
+            if ($scheduled_hour != $scan_hour) {
+                error_log("BCV: Hora de escaneo cambió de $scheduled_hour a $scan_hour, reprogramando cron");
                 wp_clear_scheduled_hook('bcv_daily_rate_update');
                 $scheduled = false;
             }
@@ -632,11 +690,11 @@ class WC_BCV_Converter {
             $caracas_timezone = new DateTimeZone('America/Caracas');
             $caracas_time = new DateTime('now', $caracas_timezone);
 
-            if ($caracas_time->format('H') >= $sync_hour) {
+            if ($caracas_time->format('H') >= $scan_hour) {
                 $caracas_time->modify('+1 day');
             }
 
-            $caracas_time->setTime($sync_hour, 0, 0);
+            $caracas_time->setTime($scan_hour, 0, 0);
             $caracas_time->setTimezone(new DateTimeZone('UTC'));
             $timestamp = $caracas_time->getTimestamp();
 
@@ -652,28 +710,50 @@ class WC_BCV_Converter {
         error_log("BCV: 🔄 Ejecutando actualización automática diaria (vía wp-cron)");
 
         // No actualizar automáticamente en fines de semana
-        // El cliente configurará manualmente la tasa el viernes
-        if ($this->is_weekend()) {
-            error_log("BCV: ⏸️ Fin de semana detectado - Actualización automática saltada (usar tasa manual)");
+        $weekend_mode_enabled = get_option('bcv_weekend_mode_enabled', false);
+        if ($this->is_weekend() && $weekend_mode_enabled) {
+            error_log("BCV: ⏸️ Fin de semana detectado con modo fin de semana habilitado - Actualización automática saltada");
             return;
         }
 
-        $caracas_date = $this->get_caracas_date();
-        error_log("BCV: 📅 Fecha Venezuela: $caracas_date");
+        $caracas_timezone = new DateTimeZone('America/Caracas');
+        $caracas_now = new DateTime('now', $caracas_timezone);
+        $current_date = $caracas_now->format('Y-m-d');
+        $current_time = $caracas_now->format('H:i:s');
+
+        error_log("BCV: 📅 Fecha/Hora Venezuela: $current_date $current_time");
+
+        // Determinar para qué fecha es esta tasa
+        // Si escaneamos a las 9pm, la tasa es para el día siguiente (a partir de 00:30)
+        $apply_hour = intval(get_option('bcv_apply_hour', 0));
+        $apply_minute = intval(get_option('bcv_apply_minute', 30));
+
+        // La tasa escaneada es para el día siguiente si aplicará después de medianoche
+        if ($apply_hour >= 0 && $apply_hour <= 12) {
+            // Si la hora de aplicación es temprana (00:00-12:00), la tasa es para mañana
+            $target_date = clone $caracas_now;
+            $target_date->modify('+1 day');
+            $target_date_str = $target_date->format('Y-m-d');
+            error_log("BCV: 📆 Tasa será para el día siguiente: $target_date_str a las $apply_hour:$apply_minute");
+        } else {
+            // Si la hora de aplicación es tarde (después de 12:00), es para hoy
+            $target_date_str = $current_date;
+            error_log("BCV: 📆 Tasa es para hoy: $target_date_str a las $apply_hour:$apply_minute");
+        }
 
         $this->processing = true;
         $rate = $this->fetch_bcv_rate();
         $this->processing = false;
 
         if ($rate && $rate >= 80 && $rate <= 300) {
-            $this->store_daily_rate($rate);
-            error_log("BCV: ✅ Actualización automática exitosa - Nueva tasa: $rate Bs.");
+            $this->store_daily_rate($rate, $target_date_str);
+            error_log("BCV: ✅ Actualización automática exitosa - Nueva tasa: $rate Bs. para $target_date_str");
         } else {
             error_log("BCV: ❌ Error en actualización automática - No se pudo obtener tasa válida");
             // Registrar evento de fallo para debugging
             update_option('bcv_last_cron_failure', array(
-                'date' => $caracas_date,
-                'time' => $this->get_caracas_date('H:i:s'),
+                'date' => $current_date,
+                'time' => $current_time,
                 'rate_attempted' => $rate
             ));
         }
@@ -695,11 +775,50 @@ class WC_BCV_Converter {
         register_setting('bcv_converter_settings', 'bcv_converter_enabled');
         register_setting('bcv_converter_settings', 'bcv_display_mode');
         register_setting('bcv_converter_settings', 'bcv_payment_gateway_mode');
-        register_setting('bcv_converter_settings', 'bcv_fallback_rate');
-        register_setting('bcv_converter_settings', 'bcv_weekend_manual_rate');
-        register_setting('bcv_converter_settings', 'bcv_sync_hour', array(
+
+        // Modo de operación: manual o automático
+        register_setting('bcv_converter_settings', 'bcv_rate_mode', array(
+            'type' => 'string',
+            'default' => 'automatic'
+        ));
+
+        // Tasa manual (solo se usa si mode = 'manual')
+        register_setting('bcv_converter_settings', 'bcv_manual_rate', array(
+            'type' => 'number',
+            'default' => 0
+        ));
+
+        // Tasa de respaldo (solo se usa si el sistema automático falla)
+        register_setting('bcv_converter_settings', 'bcv_fallback_rate', array(
+            'type' => 'number',
+            'default' => 126
+        ));
+
+        // Configuración de fin de semana
+        register_setting('bcv_converter_settings', 'bcv_weekend_mode_enabled', array(
+            'type' => 'boolean',
+            'default' => false
+        ));
+        register_setting('bcv_converter_settings', 'bcv_weekend_manual_rate', array(
+            'type' => 'number',
+            'default' => 0
+        ));
+
+        // Hora de escaneo (hora a la que se consulta la tasa del BCV)
+        register_setting('bcv_converter_settings', 'bcv_scan_hour', array(
             'type' => 'integer',
-            'default' => 8
+            'default' => 21 // 9pm
+        ));
+
+        // Hora de aplicación (desde qué hora del día aplica la nueva tasa)
+        register_setting('bcv_converter_settings', 'bcv_apply_hour', array(
+            'type' => 'integer',
+            'default' => 0 // medianoche
+        ));
+
+        register_setting('bcv_converter_settings', 'bcv_apply_minute', array(
+            'type' => 'integer',
+            'default' => 30 // 00:30
         ));
     }
     
@@ -744,6 +863,16 @@ class WC_BCV_Converter {
             <form method="post" action="options.php">
                 <?php settings_fields('bcv_converter_settings'); ?>
                 
+                <?php
+                $rate_mode = get_option('bcv_rate_mode', 'automatic');
+                $scan_hour = intval(get_option('bcv_scan_hour', 21));
+                $apply_hour = intval(get_option('bcv_apply_hour', 0));
+                $apply_minute = intval(get_option('bcv_apply_minute', 30));
+                $weekend_mode_enabled = get_option('bcv_weekend_mode_enabled', false);
+                ?>
+
+                <!-- Sección 1: Configuración General -->
+                <h2 style="background: #f8f9fa; padding: 15px; border-left: 5px solid #0073aa; margin-top: 20px;">⚙️ Configuración General</h2>
                 <table class="form-table">
                     <tr>
                         <th scope="row">Habilitar Conversor</th>
@@ -772,45 +901,182 @@ class WC_BCV_Converter {
                             <p class="description">Selecciona "Bolívares" si tu pasarela debe recibir los valores convertidos</p>
                         </td>
                     </tr>
+                </table>
+
+                <!-- Sección 2: Modo de Operación de Tasa -->
+                <h2 style="background: #fff3cd; padding: 15px; border-left: 5px solid #ffc107; margin-top: 30px;">💰 Modo de Operación de Tasa de Cambio</h2>
+                <div style="background: #fffbf0; padding: 15px; margin: 10px 0; border-radius: 5px;">
+                    <p style="margin: 0 0 10px 0; font-size: 14px;">
+                        <strong>Elige cómo quieres manejar la tasa de cambio:</strong>
+                    </p>
+                    <ul style="margin: 5px 0; padding-left: 25px;">
+                        <li><strong>Tasa Manual:</strong> Tú controlas la tasa manualmente y la cambias cuando desees</li>
+                        <li><strong>Tasa Dinámica (Automática):</strong> El plugin obtiene automáticamente la tasa del BCV</li>
+                    </ul>
+                </div>
+                <table class="form-table">
                     <tr>
-                        <th scope="row">Tasa de Respaldo</th>
+                        <th scope="row"><strong>Modo de Tasa</strong></th>
                         <td>
-                            <input type="number" name="bcv_fallback_rate" value="<?php echo get_option('bcv_fallback_rate', 126); ?>" step="0.01" min="0.01">
-                            <p class="description">Tasa a usar cuando no se pueda obtener del BCV</p>
+                            <label style="display: block; margin-bottom: 10px;">
+                                <input type="radio" name="bcv_rate_mode" value="manual" <?php checked($rate_mode, 'manual'); ?>>
+                                <strong>Tasa Manual Fija</strong> - Yo controlaré la tasa manualmente
+                            </label>
+                            <label style="display: block;">
+                                <input type="radio" name="bcv_rate_mode" value="automatic" <?php checked($rate_mode, 'automatic'); ?>>
+                                <strong>Tasa Dinámica Automática</strong> - Obtener automáticamente del BCV
+                            </label>
                         </td>
                     </tr>
-                    <tr style="background-color: #e7f3ff; border-left: 4px solid #0073aa;">
-                        <th scope="row">
-                            <span style="color: #0073aa;">⏰ Hora de Sincronización Automática</span>
-                        </th>
+                    <tr id="manual_rate_row" style="<?php echo ($rate_mode === 'manual') ? '' : 'display:none;'; ?>">
+                        <th scope="row">Tasa Manual</th>
                         <td>
-                            <select name="bcv_sync_hour">
-                                <?php for ($h = 0; $h < 24; $h++): ?>
-                                    <option value="<?php echo $h; ?>" <?php selected($sync_hour, $h); ?>>
-                                        <?php echo sprintf('%02d:00 (Hora de Venezuela)', $h); ?>
-                                    </option>
-                                <?php endfor; ?>
-                            </select>
-                            <p class="description" style="color: #0073aa;">
-                                <strong>Hora de Venezuela (UTC-4)</strong> a la que se consultará la tasa del BCV automáticamente cada día.
-                                <br>Por defecto: 08:00 AM. Esta sincronización NO ocurre en fines de semana.
+                            <input type="number" name="bcv_manual_rate" value="<?php echo get_option('bcv_manual_rate', ''); ?>" step="0.01" min="0.01" placeholder="Ej: 45.50" style="width: 200px;">
+                            <span style="margin-left: 10px;">Bs.</span>
+                            <p class="description">
+                                Esta es la tasa fija que se usará en todo momento. Actualízala cuando lo necesites.
                             </p>
                         </td>
                     </tr>
-                    <tr style="background-color: #fff3cd; border-left: 4px solid #ffc107;">
-                        <th scope="row">
-                            <span style="color: #856404;">📅 Tasa Manual para Fines de Semana</span>
-                        </th>
+                    <tr id="fallback_rate_row" style="<?php echo ($rate_mode === 'automatic') ? '' : 'display:none;'; ?>">
+                        <th scope="row">Tasa de Respaldo</th>
                         <td>
-                            <input type="number" name="bcv_weekend_manual_rate" value="<?php echo get_option('bcv_weekend_manual_rate', ''); ?>" step="0.01" min="0.01" placeholder="Ej: 55.50">
-                            <p class="description" style="color: #856404;">
-                                <strong>⚠️ Importante:</strong> Configure esta tasa el <strong>viernes por la tarde</strong> para que se use durante todo el fin de semana (sábado y domingo).
-                                <br>Esta será la tasa del banco que le proporcionen para el lunes siguiente.
-                                <br>Durante el fin de semana, el sistema <strong>NO consultará</strong> la tasa automática y usará este valor.
+                            <input type="number" name="bcv_fallback_rate" value="<?php echo get_option('bcv_fallback_rate', 126); ?>" step="0.01" min="0.01" style="width: 200px;">
+                            <span style="margin-left: 10px;">Bs.</span>
+                            <p class="description" style="color: #666;">
+                                Solo se usa si el sistema automático falla al obtener la tasa del BCV
                             </p>
                         </td>
                     </tr>
                 </table>
+
+                <!-- Sección 3: Configuración de Horarios (solo en modo automático) -->
+                <div id="automatic_settings" style="<?php echo ($rate_mode === 'automatic') ? '' : 'display:none;'; ?>">
+                    <h2 style="background: #e7f3ff; padding: 15px; border-left: 5px solid #0073aa; margin-top: 30px;">⏰ Configuración de Horarios</h2>
+                    <div style="background: #f0f8ff; padding: 15px; margin: 10px 0; border-radius: 5px;">
+                        <p style="margin: 0 0 10px 0; font-size: 14px;">
+                            <strong>Nueva funcionalidad:</strong> El BCV publica la tasa del día siguiente a las 8:00 PM del día anterior.
+                            Configura cuándo escanear y cuándo aplicar la tasa:
+                        </p>
+                        <ul style="margin: 5px 0; padding-left: 25px;">
+                            <li><strong>Hora de Escaneo:</strong> Cuándo consultar el BCV (recomendado: 9:00 PM)</li>
+                            <li><strong>Hora de Aplicación:</strong> Desde qué hora del día se activa la nueva tasa (recomendado: 00:30 AM)</li>
+                        </ul>
+                    </div>
+                    <table class="form-table">
+                        <tr>
+                            <th scope="row">
+                                <span style="color: #0073aa;">📡 Hora de Escaneo</span>
+                            </th>
+                            <td>
+                                <select name="bcv_scan_hour" style="width: 250px;">
+                                    <?php for ($h = 0; $h < 24; $h++): ?>
+                                        <option value="<?php echo $h; ?>" <?php selected($scan_hour, $h); ?>>
+                                            <?php echo sprintf('%02d:00 (Hora de Venezuela)', $h); ?>
+                                        </option>
+                                    <?php endfor; ?>
+                                </select>
+                                <p class="description" style="color: #0073aa;">
+                                    <strong>¿A qué hora consultar la tasa del BCV?</strong><br>
+                                    Recomendado: <strong>21:00 (9:00 PM)</strong> - Después que el BCV publique a las 8:00 PM
+                                </p>
+                            </td>
+                        </tr>
+                        <tr>
+                            <th scope="row">
+                                <span style="color: #0073aa;">✅ Hora de Aplicación</span>
+                            </th>
+                            <td>
+                                <select name="bcv_apply_hour" style="width: 120px;">
+                                    <?php for ($h = 0; $h < 24; $h++): ?>
+                                        <option value="<?php echo $h; ?>" <?php selected($apply_hour, $h); ?>>
+                                            <?php echo sprintf('%02d', $h); ?>
+                                        </option>
+                                    <?php endfor; ?>
+                                </select>
+                                <span style="margin: 0 5px;">:</span>
+                                <select name="bcv_apply_minute" style="width: 100px;">
+                                    <?php for ($m = 0; $m < 60; $m += 5): ?>
+                                        <option value="<?php echo $m; ?>" <?php selected($apply_minute, $m); ?>>
+                                            <?php echo sprintf('%02d', $m); ?>
+                                        </option>
+                                    <?php endfor; ?>
+                                </select>
+                                <span style="margin-left: 10px; color: #666;">(Hora de Venezuela)</span>
+                                <p class="description" style="color: #0073aa;">
+                                    <strong>¿Desde qué hora del día se activa la nueva tasa?</strong><br>
+                                    Recomendado: <strong>00:30</strong> - La tasa escaneada a las 9PM se activa después de medianoche
+                                </p>
+                                <div style="background: #fff3cd; padding: 10px; margin-top: 10px; border-left: 3px solid #ffc107; border-radius: 3px;">
+                                    <strong>📋 Ejemplo de funcionamiento:</strong><br>
+                                    • Lunes 9:00 PM → Se escanea la tasa del BCV para el martes<br>
+                                    • Martes 00:30 AM → Se activa la nueva tasa en el sitio<br>
+                                    • Entre Lunes 9PM y Martes 00:30 AM → Se usa la tasa del lunes
+                                </div>
+                            </td>
+                        </tr>
+                    </table>
+                </div>
+
+                <!-- Sección 4: Configuración de Fin de Semana (solo en modo automático) -->
+                <div id="weekend_settings" style="<?php echo ($rate_mode === 'automatic') ? '' : 'display:none;'; ?>">
+                    <h2 style="background: #fff3cd; padding: 15px; border-left: 5px solid #ffc107; margin-top: 30px;">📅 Configuración de Fin de Semana</h2>
+                    <table class="form-table">
+                        <tr>
+                            <th scope="row">Modo Fin de Semana</th>
+                            <td>
+                                <label>
+                                    <input type="checkbox" name="bcv_weekend_mode_enabled" value="1" <?php checked($weekend_mode_enabled, true); ?>>
+                                    <strong>Activar tasa manual para fines de semana</strong>
+                                </label>
+                                <p class="description">
+                                    Si lo activas, podrás configurar una tasa específica para sábados y domingos
+                                </p>
+                            </td>
+                        </tr>
+                        <tr id="weekend_rate_row" style="<?php echo $weekend_mode_enabled ? '' : 'display:none;'; ?>">
+                            <th scope="row">Tasa de Fin de Semana</th>
+                            <td>
+                                <input type="number" name="bcv_weekend_manual_rate" value="<?php echo get_option('bcv_weekend_manual_rate', ''); ?>" step="0.01" min="0.01" placeholder="Ej: 45.50" style="width: 200px;">
+                                <span style="margin-left: 10px;">Bs.</span>
+                                <p class="description" style="color: #856404;">
+                                    <strong>⚠️ Importante:</strong> Configure esta tasa el <strong>viernes por la tarde</strong>.<br>
+                                    Se usará durante todo el fin de semana (sábado y domingo).<br>
+                                    Esta será la tasa que el banco te proporcione para el lunes siguiente.
+                                </p>
+                            </td>
+                        </tr>
+                    </table>
+                </div>
+
+                <script type="text/javascript">
+                jQuery(document).ready(function($) {
+                    // Toggle entre modo manual y automático
+                    $('input[name="bcv_rate_mode"]').change(function() {
+                        var mode = $(this).val();
+                        if (mode === 'manual') {
+                            $('#manual_rate_row').show();
+                            $('#fallback_rate_row').hide();
+                            $('#automatic_settings').hide();
+                            $('#weekend_settings').hide();
+                        } else {
+                            $('#manual_rate_row').hide();
+                            $('#fallback_rate_row').show();
+                            $('#automatic_settings').show();
+                            $('#weekend_settings').show();
+                        }
+                    });
+
+                    // Toggle de tasa de fin de semana
+                    $('input[name="bcv_weekend_mode_enabled"]').change(function() {
+                        if ($(this).is(':checked')) {
+                            $('#weekend_rate_row').show();
+                        } else {
+                            $('#weekend_rate_row').hide();
+                        }
+                    });
+                });
+                </script>
                 
                 <div style="background: #f1f1f1; padding: 20px; margin: 20px 0; border-radius: 5px;">
                     <h3>📊 Estado Actual</h3>
@@ -829,9 +1095,24 @@ class WC_BCV_Converter {
                     $last_cron_failure = get_option('bcv_last_cron_failure');
                     ?>
 
-                    <!-- Información de Diagnóstico -->
+                    <p><strong>Modo de operación:</strong>
+                        <?php if ($rate_mode === 'manual'): ?>
+                            <span style="color: #856404; font-weight: bold; background: #fff3cd; padding: 4px 8px; border-radius: 3px;">
+                                ✋ MODO MANUAL
+                            </span>
+                            <br><small style="color: #856404;">La tasa es controlada manualmente por el administrador</small>
+                        <?php else: ?>
+                            <span style="color: #0073aa; font-weight: bold; background: #e7f3ff; padding: 4px 8px; border-radius: 3px;">
+                                🤖 MODO AUTOMÁTICO
+                            </span>
+                            <br><small style="color: #0073aa;">La tasa se obtiene automáticamente del BCV</small>
+                        <?php endif; ?>
+                    </p>
+
+                    <?php if ($rate_mode === 'automatic'): ?>
+                    <!-- Información de Diagnóstico (solo en modo automático) -->
                     <div style="background: white; padding: 15px; margin: 15px 0; border-left: 4px solid #28a745; border-radius: 4px;">
-                        <h4 style="margin-top: 0; color: #28a745;">🔍 Diagnóstico del Sistema</h4>
+                        <h4 style="margin-top: 0; color: #28a745;">🔍 Diagnóstico del Sistema Automático</h4>
 
                         <p style="margin: 8px 0;">
                             <strong>📡 Última fuente exitosa:</strong>
@@ -855,12 +1136,12 @@ class WC_BCV_Converter {
                         <?php endif; ?>
 
                         <p style="margin: 8px 0; padding: 8px; background: #e7f3ff; border-radius: 3px; font-size: 12px;">
-                            💡 <strong>Nuevo en v1.4:</strong> El sistema ahora incluye recuperación automática.
+                            💡 <strong>Nuevo en v1.5:</strong> El sistema ahora incluye recuperación automática.
                             Si detecta que la tasa está desactualizada, la actualizará automáticamente en la próxima visita.
                         </p>
                     </div>
 
-                    <!-- Información de Sincronización -->
+                    <!-- Información de Sincronización (solo en modo automático) -->
                     <div style="background: white; padding: 15px; margin: 15px 0; border-left: 4px solid #0073aa; border-radius: 4px;">
                         <h4 style="margin-top: 0; color: #0073aa;">⏰ Información de Sincronización Automática</h4>
 
@@ -908,12 +1189,15 @@ class WC_BCV_Converter {
                         <?php endif; ?>
 
                         <p style="margin: 8px 0; padding: 10px; background: #e7f3ff; border-radius: 4px; font-size: 13px;">
-                            💡 <strong>Nota:</strong> La sincronización automática consulta la tasa del BCV a la hora configurada (<?php echo sprintf('%02d:00', $sync_hour); ?> Venezuela).
-                            Durante los fines de semana (sábado y domingo) NO se sincroniza automáticamente; se usa la tasa manual configurada.
+                            💡 <strong>Nota:</strong> La sincronización automática consulta la tasa del BCV a la hora configurada (<?php echo sprintf('%02d:00', $scan_hour); ?> Venezuela).
+                            <?php if ($weekend_mode_enabled): ?>
+                                Durante los fines de semana (sábado y domingo) NO se sincroniza automáticamente; se usa la tasa manual configurada.
+                            <?php endif; ?>
                         </p>
                     </div>
 
-                    <p><strong>Modo de tasa:</strong>
+                    <?php if ($weekend_mode_enabled): ?>
+                    <p><strong>Estado de fin de semana:</strong>
                         <?php if ($is_weekend && $weekend_rate && $weekend_rate > 0): ?>
                             <span style="color: #ffc107; font-weight: bold; background: #fff3cd; padding: 4px 8px; border-radius: 3px;">
                                 📅 TASA MANUAL DE FIN DE SEMANA (<?php echo number_format($weekend_rate, 2, ',', '.'); ?> Bs.)
@@ -926,11 +1210,13 @@ class WC_BCV_Converter {
                             <br><small style="color: #721c24;">Configure la tasa manual arriba para fines de semana</small>
                         <?php else: ?>
                             <span style="color: #28a745; font-weight: bold; background: #d4edda; padding: 4px 8px; border-radius: 3px;">
-                                🔄 TASA AUTOMÁTICA BCV
+                                ✅ DÍA LABORABLE
                             </span>
-                            <br><small style="color: #155724;">Se actualiza automáticamente todos los días a las 8:00 AM</small>
+                            <br><small style="color: #155724;">Se usará la tasa automática del BCV</small>
                         <?php endif; ?>
                     </p>
+                    <?php endif; ?>
+                    <?php endif; // fin de modo automático ?>
 
                     <p><strong>Envío a pasarela:</strong>
                         <?php if ($payment_mode === 'ves'): ?>
