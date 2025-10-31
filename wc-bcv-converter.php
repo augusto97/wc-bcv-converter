@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce BCV Currency Converter
  * Plugin URI: https://yoursite.com/
  * Description: Convierte automáticamente precios de USD a Bolívares Venezolanos usando la tasa oficial del BCV en el checkout
- * Version: 1.3.1
+ * Version: 1.4.0
  * Author: Tu Nombre
  * Text Domain: wc-bcv-converter
  * WC requires at least: 3.0
@@ -26,8 +26,8 @@ add_action('before_woocommerce_init', function() {
 });
 
 class WC_BCV_Converter {
-    
-    private $plugin_version = '1.3.1';
+
+    private $plugin_version = '1.4.0';
     private $cache_key = 'bcv_exchange_rate';
     private $processing = false;
     private static $instance = null;
@@ -225,6 +225,7 @@ class WC_BCV_Converter {
                 return floatval($weekend_rate);
             }
             // Si no hay tasa manual configurada, continuar con la lógica normal
+            error_log("BCV: Fin de semana detectado pero sin tasa manual configurada");
         }
 
         $today = $this->get_caracas_date();
@@ -233,9 +234,33 @@ class WC_BCV_Converter {
 
         error_log("BCV: Comparando fechas - Hoy: $today, Almacenada: $stored_date, Tasa almacenada: $stored_rate");
 
+        // Si la fecha almacenada coincide con hoy, usar esa tasa
         if ($stored_date === $today && $stored_rate && $stored_rate > 0) {
             error_log("BCV: Usando tasa almacenada de hoy: $stored_rate Bs.");
             return floatval($stored_rate);
+        }
+
+        // MEJORA: Detectar si la tasa es antigua y necesita actualización urgente
+        if ($stored_date && $stored_date !== $today) {
+            $days_diff = $this->get_business_days_diff($stored_date, $today);
+            error_log("BCV: Tasa desactualizada detectada. Días laborables de diferencia: $days_diff");
+
+            // Si la tasa es de 1+ días laborables atrás, intentar actualización inmediata
+            if ($days_diff >= 1 && !$this->is_weekend()) {
+                error_log("BCV: ⚠️ RECUPERACIÓN AUTOMÁTICA - Tasa antigua detectada, forzando actualización inmediata");
+                $new_rate = $this->fetch_bcv_rate();
+                if ($new_rate && $new_rate >= 80 && $new_rate <= 300) {
+                    $this->store_daily_rate($new_rate);
+                    error_log("BCV: ✅ Recuperación exitosa - Nueva tasa: $new_rate Bs.");
+                    return $new_rate;
+                } else {
+                    error_log("BCV: ❌ Recuperación falló - Usando tasa almacenada antigua como respaldo");
+                    // Devolver la tasa antigua como último recurso
+                    if ($stored_rate && $stored_rate > 0) {
+                        return floatval($stored_rate);
+                    }
+                }
+            }
         }
 
         error_log("BCV: Fecha no coincide o no hay tasa almacenada, se requiere actualización");
@@ -272,29 +297,77 @@ class WC_BCV_Converter {
         return ($day_of_week == 6 || $day_of_week == 7); // 6 = Sábado, 7 = Domingo
     }
 
+    /**
+     * Calcula la diferencia de días laborables entre dos fechas (excluyendo fines de semana)
+     * Útil para detectar si una tasa está desactualizada
+     */
+    private function get_business_days_diff($start_date, $end_date) {
+        try {
+            $caracas_timezone = new DateTimeZone('America/Caracas');
+            $start = new DateTime($start_date, $caracas_timezone);
+            $end = new DateTime($end_date, $caracas_timezone);
+
+            // Si end es anterior a start, retornar 0
+            if ($end < $start) {
+                return 0;
+            }
+
+            $business_days = 0;
+            $current = clone $start;
+
+            // Contar días laborables entre las fechas
+            while ($current <= $end) {
+                $day_of_week = $current->format('N'); // 1 = Lunes, 7 = Domingo
+                // Solo contar si no es sábado (6) ni domingo (7)
+                if ($day_of_week < 6) {
+                    $business_days++;
+                }
+                $current->modify('+1 day');
+            }
+
+            // Restar 1 porque el día de inicio no debe contarse
+            return max(0, $business_days - 1);
+        } catch (Exception $e) {
+            error_log("BCV: Error calculando días laborables: " . $e->getMessage());
+            return 0;
+        }
+    }
+
     private function get_fallback_rate() {
         $fallback = get_option('bcv_fallback_rate', 126);
         return floatval($fallback);
     }
     
     private function fetch_bcv_rate() {
+        error_log("BCV: 🌐 Iniciando consulta de tasa BCV...");
+
         $methods = array(
-            'fetch_from_dolarapi',
-            'fetch_from_bcv_official'
+            'fetch_from_dolarapi' => 'DolarAPI',
+            'fetch_from_bcv_official' => 'BCV Oficial'
         );
-        
-        foreach ($methods as $method) {
+
+        foreach ($methods as $method => $source_name) {
             try {
+                error_log("BCV: 📡 Intentando con fuente: $source_name");
                 $rate = $this->$method();
+
                 if ($rate && $rate >= 80 && $rate <= 300) {
+                    error_log("BCV: ✅ Tasa obtenida exitosamente de $source_name: $rate Bs.");
                     update_option('bcv_last_successful_rate', $rate);
+                    update_option('bcv_last_successful_source', $source_name);
+                    update_option('bcv_last_fetch_attempt', current_time('mysql'));
                     return $rate;
+                } else {
+                    error_log("BCV: ⚠️ Tasa de $source_name fuera de rango: $rate Bs.");
                 }
             } catch (Exception $e) {
+                error_log("BCV: ❌ Error con $source_name: " . $e->getMessage());
                 continue;
             }
         }
-        
+
+        error_log("BCV: ❌ FALLO TOTAL - No se pudo obtener tasa de ninguna fuente");
+        update_option('bcv_last_fetch_attempt', current_time('mysql'));
         return false;
     }
     
@@ -528,6 +601,16 @@ class WC_BCV_Converter {
     
     // SISTEMA DE ACTUALIZACIÓN DIARIA
     public function schedule_daily_rate_update() {
+        // OPTIMIZACIÓN: Solo verificar el cron cada 6 horas en lugar de cada carga de página
+        $last_check = get_transient('bcv_cron_last_check');
+        if ($last_check !== false) {
+            // Ya verificamos recientemente, no hacer nada
+            return;
+        }
+
+        // Marcar que verificamos ahora (válido por 6 horas)
+        set_transient('bcv_cron_last_check', time(), 6 * HOUR_IN_SECONDS);
+
         $sync_hour = intval(get_option('bcv_sync_hour', 8));
         $scheduled = wp_next_scheduled('bcv_daily_rate_update');
 
@@ -539,6 +622,7 @@ class WC_BCV_Converter {
             $scheduled_hour = intval($scheduled_time->format('H'));
 
             if ($scheduled_hour != $sync_hour) {
+                error_log("BCV: Hora de sincronización cambió de $scheduled_hour a $sync_hour, reprogramando cron");
                 wp_clear_scheduled_hook('bcv_daily_rate_update');
                 $scheduled = false;
             }
@@ -557,15 +641,25 @@ class WC_BCV_Converter {
             $timestamp = $caracas_time->getTimestamp();
 
             wp_schedule_event($timestamp, 'daily', 'bcv_daily_rate_update');
+
+            $next_run = new DateTime('@' . $timestamp);
+            $next_run->setTimezone($caracas_timezone);
+            error_log("BCV: ✅ Cron programado para " . $next_run->format('Y-m-d H:i:s') . " (Hora Venezuela)");
         }
     }
     
     public function update_daily_rate() {
+        error_log("BCV: 🔄 Ejecutando actualización automática diaria (vía wp-cron)");
+
         // No actualizar automáticamente en fines de semana
         // El cliente configurará manualmente la tasa el viernes
         if ($this->is_weekend()) {
+            error_log("BCV: ⏸️ Fin de semana detectado - Actualización automática saltada (usar tasa manual)");
             return;
         }
+
+        $caracas_date = $this->get_caracas_date();
+        error_log("BCV: 📅 Fecha Venezuela: $caracas_date");
 
         $this->processing = true;
         $rate = $this->fetch_bcv_rate();
@@ -573,6 +667,15 @@ class WC_BCV_Converter {
 
         if ($rate && $rate >= 80 && $rate <= 300) {
             $this->store_daily_rate($rate);
+            error_log("BCV: ✅ Actualización automática exitosa - Nueva tasa: $rate Bs.");
+        } else {
+            error_log("BCV: ❌ Error en actualización automática - No se pudo obtener tasa válida");
+            // Registrar evento de fallo para debugging
+            update_option('bcv_last_cron_failure', array(
+                'date' => $caracas_date,
+                'time' => $this->get_caracas_date('H:i:s'),
+                'rate_attempted' => $rate
+            ));
         }
     }
     
@@ -719,7 +822,43 @@ class WC_BCV_Converter {
                     $day_of_week = $caracas_time->format('N');
                     $is_weekend = ($day_of_week == 6 || $day_of_week == 7);
                     $weekend_rate = get_option('bcv_weekend_manual_rate');
+
+                    // Información adicional de diagnóstico
+                    $last_successful_source = get_option('bcv_last_successful_source', 'Desconocido');
+                    $last_fetch_attempt = get_option('bcv_last_fetch_attempt', 'Nunca');
+                    $last_cron_failure = get_option('bcv_last_cron_failure');
                     ?>
+
+                    <!-- Información de Diagnóstico -->
+                    <div style="background: white; padding: 15px; margin: 15px 0; border-left: 4px solid #28a745; border-radius: 4px;">
+                        <h4 style="margin-top: 0; color: #28a745;">🔍 Diagnóstico del Sistema</h4>
+
+                        <p style="margin: 8px 0;">
+                            <strong>📡 Última fuente exitosa:</strong>
+                            <span style="color: #0073aa;"><?php echo esc_html($last_successful_source); ?></span>
+                        </p>
+
+                        <p style="margin: 8px 0;">
+                            <strong>🕐 Último intento de consulta:</strong>
+                            <span style="color: #666;"><?php echo esc_html($last_fetch_attempt); ?></span>
+                        </p>
+
+                        <?php if ($last_cron_failure): ?>
+                            <div style="background: #fff3cd; border-left: 3px solid #ffc107; padding: 10px; margin: 10px 0; border-radius: 3px;">
+                                <p style="margin: 5px 0; color: #856404;">
+                                    <strong>⚠️ Último fallo de cron:</strong><br>
+                                    📅 Fecha: <?php echo esc_html($last_cron_failure['date']); ?>
+                                    a las <?php echo esc_html($last_cron_failure['time']); ?><br>
+                                    💰 Tasa intentada: <?php echo esc_html($last_cron_failure['rate_attempted'] ?: 'N/A'); ?>
+                                </p>
+                            </div>
+                        <?php endif; ?>
+
+                        <p style="margin: 8px 0; padding: 8px; background: #e7f3ff; border-radius: 3px; font-size: 12px;">
+                            💡 <strong>Nuevo en v1.4:</strong> El sistema ahora incluye recuperación automática.
+                            Si detecta que la tasa está desactualizada, la actualizará automáticamente en la próxima visita.
+                        </p>
+                    </div>
 
                     <!-- Información de Sincronización -->
                     <div style="background: white; padding: 15px; margin: 15px 0; border-left: 4px solid #0073aa; border-radius: 4px;">
